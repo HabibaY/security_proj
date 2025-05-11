@@ -15,16 +15,19 @@ DH_PARAMS_FILE = "dh_params.pem"
 # Encrypt data
 def encrypt(plaintext: bytes, key: bytes) -> bytes:
     aesgcm = AESGCM(key)
-    nonce = os.urandom(12)
+    nonce = os.urandom(12)  # AES-GCM requires 12 bytes
     ct = aesgcm.encrypt(nonce, plaintext, None)
-    return nonce + ct
+    return nonce + ct  # prepend nonce
 
+
+# Decrypt data
 # Decrypt data
 def decrypt(data: bytes, key: bytes) -> bytes:
     aesgcm = AESGCM(key)
     nonce = data[:12]
     ct = data[12:]
     return aesgcm.decrypt(nonce, ct, None)
+
 
 # Derive key from password using Argon2id
 def derive_key_from_password(password: str, salt: bytes) -> bytes:

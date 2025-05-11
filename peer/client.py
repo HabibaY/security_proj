@@ -83,7 +83,25 @@ def peer_client_menu(peers):
             if choice == "2":
                 list_files(peer_ip, peer_port, token)
             elif choice == "3":
-                download_file(peer_ip, peer_port, token)
+                # First list files to select one
+                files = list_files(peer_ip, peer_port, token)
+                if not files:
+                    continue
+                    
+                try:
+                    file_idx = int(input("\nEnter file number to download (0 to cancel): ").strip()) - 1
+                    if file_idx < 0:
+                        print("Download cancelled")
+                        continue
+                    if file_idx >= len(files):
+                        print("[!] Invalid file number")
+                        continue
+                        
+                    filename = files[file_idx]
+                    download_file(peer_ip, peer_port, token, filename)
+                except ValueError:
+                    print("[!] Invalid selection")
+                    
             elif choice == "4":
                 upload_file(peer_ip, peer_port, token)
 
@@ -162,32 +180,64 @@ def authenticate_with_peer(ip, port):
 
 def list_files(ip, port, token):
     try:
-        # Establish socket connection
-        with socket.create_connection((ip, port), timeout=10) as sock:
-            # Send list files command with token
-            command = f"{token} LIST_FILES"
-            sock.sendall(command.encode())
-
-            # Perform key exchange
-            session_key, _ = perform_key_exchange(sock)
+        with socket.create_connection((ip, port), timeout=30) as sock:
+            # 1. First send the authenticated command
+            sock.sendall(f"{token} LIST_FILES\n".encode())
+            
+            # 2. Then perform key exchange
+            session_key, extra_data = perform_key_exchange(sock)
             print("[+] Key exchange successful")
 
-            # Receive encrypted file list
+            # 3. Check if we already received SIZE header in extra_data
+            if extra_data and b"SIZE:" in extra_data:
+                # Split into lines
+                lines = extra_data.split(b"\n")
+                for line in lines:
+                    if line.startswith(b"SIZE:"):
+                        size_header = line.decode().strip()
+                        break
+                # Send READY immediately
+                sock.sendall(b"READY")
+            else:
+                # 4. Receive response or error
+                response = recv_until(sock, b"\n").decode().strip()
+                if response.startswith("ERROR:"):
+                    print(f"[-] {response}")
+                    return []
+
+                # 5. Receive size header
+                size_header = recv_until(sock, b"\n").decode().strip()
+                if not size_header.startswith("SIZE:"):
+                    print("[-] Invalid size header received")
+                    return []
+
+                # 6. Send ready signal
+                sock.sendall(b"READY")
+
+            try:
+                filesize = int(size_header[5:])
+            except ValueError:
+                print("[-] Invalid file size format")
+                return []
+
+            # 7. Receive encrypted data
             encrypted_data = b""
-            while True:
-                chunk = sock.recv(4096)
+            remaining = filesize
+            while remaining > 0:
+                chunk = sock.recv(min(4096, remaining))
                 if not chunk:
                     break
                 encrypted_data += chunk
+                remaining -= len(chunk)
 
-            if encrypted_data.startswith(b"ERROR:"):
-                print("[-]", encrypted_data.decode())
-                return []
-
-            # Decrypt the file list
+            # 8. Decrypt
             from peer.crypto_utils import decrypt
-            plaintext = decrypt(encrypted_data, session_key)
-            file_list = plaintext.decode().strip().splitlines()
+            try:
+                plaintext = decrypt(encrypted_data, session_key)
+                file_list = plaintext.decode().strip().splitlines()
+            except Exception as e:
+                print(f"[-] Decryption failed: {e}")
+                return []
 
             if not file_list:
                 print("[-] No files available on the peer.")
@@ -203,89 +253,77 @@ def list_files(ip, port, token):
         return []
 
 
-
-def download_file(ip, port, token):
-    s = None
+def download_file(ip, port, token, filename):
     try:
-        # Step 1: List files
-        file_list = list_files(ip, port, token)
-        if not file_list:
-            return None
-
-        # Let user select a file
-        choice = input("Enter file number to download: ").strip()
-        if not choice.isdigit() or not (1 <= int(choice) <= len(file_list)):
-            print("[-] Invalid selection.")
-            return None
-
-        filename = file_list[int(choice) - 1]
-
-        # Step 2: New connection for download
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(60)
-        s.connect((ip, port))
-
-        print(f"[*] Requesting download of '{filename}'")
-        s.sendall(f"{token} DOWNLOAD {filename}".encode())
-
-        # Step 3: Key exchange
-        session_key, _ = perform_key_exchange(s)
-        print("[+] Key exchange successful")
-
-        # Step 4: Receive size header
-        header = recv_until(s, b"\n")
-        if header.startswith(b"ERROR:"):
-            print(f"\n[-] Server error: {header.decode()}")
-            s.close()
-            return None
-
-        try:
-            size_part = header.decode().strip()
-            if not size_part.startswith("SIZE:"):
-                raise ValueError("Invalid size header")
-
-            filesize = int(size_part[5:])
-            print(f"[*] Downloading {filesize} bytes...")
-        except Exception as e:
-            print(f"\n[-] Invalid size format: {e}")
-            s.close()
-            return None
-
-        # Step 5: Send READY
-        s.sendall(b"READY")
-
-        # Step 6: Download file
-        received = 0
-        ciphertext = b""
-        while received < filesize:
-            remaining = filesize - received
-            chunk = s.recv(min(8192, remaining))
-            if not chunk:
-                if received < filesize:
-                    print(f"\n[-] Connection closed after {received}/{filesize} bytes")
+        with socket.create_connection((ip, port), timeout=30) as sock:
+            # First send download command with token
+            sock.sendall(f"{token} DOWNLOAD {filename}\n".encode())
+            
+            # Then perform key exchange
+            session_key, extra_data = perform_key_exchange(sock)
+            print("[+] Key exchange successful")
+            
+            # Check if we already received SIZE header in extra_data
+            size_header = None
+            if extra_data and b"SIZE:" in extra_data:
+                # Split into lines to find the SIZE header
+                lines = extra_data.split(b"\n")
+                for line in lines:
+                    if line.startswith(b"SIZE:"):
+                        size_header = line.decode().strip()
+                        break
+            
+            # If we didn't get SIZE header in extra_data, receive it normally
+            if not size_header:
+                # Receive response or error
+                response = recv_until(sock, b"\n").decode().strip()
+                if response.startswith("ERROR:"):
+                    print(f"[-] {response}")
                     return None
-                break
-
-            ciphertext += chunk
-            received += len(chunk)
-            print(f"\r{received}/{filesize} bytes ({received/filesize:.1%})", end="", flush=True)
-
-        print("\n[+] Download complete, decrypting...")
-
-        # Step 7: Decrypt and save
-        from peer.crypto_utils import decrypt
-        plaintext = decrypt(ciphertext, session_key)
-        os.makedirs(RECEIVED_DIR, exist_ok=True)
-        out_path = os.path.join(RECEIVED_DIR, filename)
-        with open(out_path, "wb") as f:
-            f.write(plaintext)
-        print(f"[+] File saved to {out_path}")
-        return out_path
+                
+                # Receive size header
+                size_header = recv_until(sock, b"\n").decode().strip()
+                if not size_header.startswith("SIZE:"):
+                    print("[-] Invalid size header")
+                    return None
+            
+            # Parse file size
+            try:
+                filesize = int(size_header[5:])
+            except ValueError:
+                print("[-] Invalid file size format")
+                return None
+                
+            # Send ready signal with newline
+            sock.sendall(b"READY\n")
+            
+            # Receive file data
+            received = 0
+            ciphertext = b""
+            while received < filesize:
+                chunk = sock.recv(min(8192, filesize - received))
+                if not chunk:
+                    break
+                ciphertext += chunk
+                received += len(chunk)
+                print(f"\r{received}/{filesize} bytes ({received/filesize:.1%})", end="", flush=True)
+            
+            # Decrypt and save file
+            from peer.crypto_utils import decrypt
+            try:
+                plaintext = decrypt(ciphertext, session_key)
+                os.makedirs(RECEIVED_DIR, exist_ok=True)
+                out_path = os.path.join(RECEIVED_DIR, filename)
+                with open(out_path, "wb") as f:
+                    f.write(plaintext)
+                print(f"\n[+] File saved to {out_path}")
+                return out_path
+            except Exception as e:
+                print(f"\n[-] Decryption failed: {e}")
+                return None
 
     except Exception as e:
         print(f"\n[-] Download failed: {e}")
-        if s:
-            s.close()
         return None
 
 def upload_file(ip, port, token):
@@ -499,6 +537,7 @@ def upload_file(ip, port, token):
 #         print(f"[DEBUG] Key exchange failed at step: {type(e).__name__}: {str(e)}")
 #         raise
 
+# client.py (updated perform_key_exchange function)
 def perform_key_exchange(sock, send_init=True):
     """Robust DH key exchange with full validation"""
     try:
@@ -516,7 +555,7 @@ def perform_key_exchange(sock, send_init=True):
         if not pubkey_bytes or len(pubkey_bytes) < 100:
             raise ValueError("Invalid public key serialization")
 
-        # 2. Receive server's key
+        # 2. Receive server's key header
         print("[DEBUG] Waiting for server's key header...")
         header = b""
         while b"\n" not in header:
@@ -524,12 +563,14 @@ def perform_key_exchange(sock, send_init=True):
             if not chunk:
                 raise ConnectionError("Connection closed while reading header")
             header += chunk
-            
+                
         print(f"[DEBUG] Received header: {header}")
         
         if not header.startswith(b"DH_PUBKEY:"):
             if header.startswith(b"KEY_EXCHANGE_FAILED"):
                 raise ValueError("Server reported key exchange failure")
+            if header.startswith(b"ERROR:"):
+                raise ValueError(f"Server error: {header.decode().strip()}")
             raise ValueError(f"Invalid server header format: {header}")
 
         # 3. Parse key size
@@ -544,8 +585,9 @@ def perform_key_exchange(sock, send_init=True):
 
         # 4. Receive full key
         print(f"[DEBUG] Receiving server key (size: {key_size})...")
-        server_key_bytes = b""
-        remaining = key_size
+        server_key_bytes = header[header.index(b"\n")+1:]  # Get any remaining data after header
+        remaining = key_size - len(server_key_bytes)
+        
         while remaining > 0:
             chunk = sock.recv(min(4096, remaining))
             if not chunk:
@@ -556,9 +598,9 @@ def perform_key_exchange(sock, send_init=True):
         # 5. Send client's key
         print("[DEBUG] Sending client's public key...")
         sock.sendall(f"CLIENT_PUBKEY:{len(pubkey_bytes)}\n".encode())
-        time.sleep(0.1)
+        time.sleep(0.1)  # Small delay to ensure separate packets
         sock.sendall(pubkey_bytes)
-        time.sleep(0.05)
+        time.sleep(0.1)  # Small delay before next operation
 
         # 6. Verify completion
         print("[DEBUG] Waiting for key exchange completion...")
@@ -568,7 +610,7 @@ def perform_key_exchange(sock, send_init=True):
             if not chunk:
                 raise ConnectionError("Connection closed during completion verification")
             completion_data += chunk
-            
+                
         # Get first line for completion check
         completion_lines = completion_data.split(b"\n")
         response_text = completion_lines[0].decode('utf-8', errors='replace')
@@ -591,9 +633,13 @@ def perform_key_exchange(sock, send_init=True):
     
             print("[DEBUG] Key exchange successful!")
             
+            # Get any extra data received after the KEY_EXCHANGE_COMPLETE line
+            extra_data = b""
+            if len(completion_lines) > 1:
+                extra_data = b"\n".join(completion_lines[1:])
+            
             # Return both the shared secret and any extra data received
-            # This is important for handling when READY comes with KEY_EXCHANGE_COMPLETE
-            return shared_secret[:32], completion_data
+            return shared_secret[:32], extra_data
         except Exception as e:
             raise ValueError(f"Key derivation failed: {e}")
         
@@ -622,7 +668,10 @@ def recv_until(sock, delimiter, timeout=30):
                 raise
             continue
             
-    return data
+    parts = data.split(delimiter, 1)
+    result = parts[0] + delimiter
+    remaining = parts[1] if len(parts) > 1 else b""
+    return result
 
 def select_file_dialog():
     try:
